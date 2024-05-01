@@ -1,212 +1,192 @@
-package project_2
+package project_3
 
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.functions._
-import org.apache.spark.rdd._
-
+import org.apache.spark.SparkContext
+import org.apache.spark.SparkConf
+import org.apache.spark.rdd.RDD
+import org.apache.spark.graphx._
+import org.apache.spark.storage.StorageLevel
+import org.apache.log4j.{Level, Logger}
 
 object main{
+  val rootLogger = Logger.getRootLogger()
+  rootLogger.setLevel(Level.ERROR)
 
-  val seed = new java.util.Date().hashCode;
-  val rand = new scala.util.Random(seed);
+  Logger.getLogger("org.apache.spark").setLevel(Level.WARN)
+  Logger.getLogger("org.spark-project").setLevel(Level.WARN)
 
-  class hash_function(numBuckets_in: Long) extends Serializable {  // a 2-universal hash family, numBuckets_in is the numer of buckets
-    val p: Long = 2147483587;  // p is a prime around 2^31 so the computation will fit into 2^63 (Long)
-    val a: Long = (rand.nextLong %(p-1)) + 1  // a is a random number is [1,p]
-    val b: Long = (rand.nextLong % p) // b is a random number in [0,p]
-    val numBuckets: Long = numBuckets_in
+  case class VertexProperties(id: Long, degree: Int, value: Double, active: String, in_MIS: String)
 
-    def convert(s: String, ind: Int): Long = {
-      if(ind==0)
-        return 0;
-      return (s(ind-1).toLong + 256 * (convert(s,ind-1))) % p;
+  def anyActive(g:Graph[VertexProperties, Int]): Boolean = {
+    g.vertices.filter{ case (id, vp) => vp.active == "active"}.count() > 0
+  }
+
+  def inRDD(rdd: RDD[Long], value: Long): Boolean = {
+    rdd.filter(x => x == value).count() > 0
+  }
+
+  def LubyMIS(g_in: Graph[Int, Int]): Graph[Int, Int] = {
+    var mis_vertices = Set[Long]()
+    val degrees = g_in.degrees
+    var degree_graph = g_in.outerJoinVertices(degrees)({ case (_, _, prop) => prop.getOrElse(0)})
+    var g_mod = degree_graph.mapVertices((id, degree) => VertexProperties(id, degree, -0.1, "active", "No"))
+    g_mod.cache()
+
+    var iterations = 0
+
+    while(anyActive(g_mod)){
+      g_mod = g_mod.mapVertices((_, prop: VertexProperties) => {
+        if (prop.active != "active") {
+          prop
+        } else {
+          val rand = new scala.util.Random
+          VertexProperties(prop.id, prop.degree, rand.nextDouble(), prop.active, prop.in_MIS)
+        }
+      })
+
+      val highest_neighbor: VertexRDD[VertexProperties] = g_mod.aggregateMessages[VertexProperties](
+        triplet => {
+          triplet.sendToDst(triplet.srcAttr)
+          triplet.sendToSrc(triplet.dstAttr)
+        },
+        (prop1, prop2) => {
+          if (prop1.value > prop2.value) {
+            prop1
+          } else {
+            prop2
+          }
+        }
+      )
+
+      val joinedVertices = g_mod.vertices.join(highest_neighbor).filter({
+        case (_, (prop, competing)) => prop.active == "active"
+      })
+
+      val message_comparison = joinedVertices.filter({
+        case (id, (prop: VertexProperties, competing: VertexProperties)) => {
+          prop.value > competing.value
+        }
+      })
+
+      val vertexIds_mis = message_comparison.map({ case ((id, (prop, competing))) => prop.id}).distinct().collect().toSet
+      val in_mis_graph = g_in.mapVertices((id, _) => vertexIds_mis.contains(id))
+      val neighbor_in_mis: VertexRDD[Boolean] = in_mis_graph.aggregateMessages[Boolean](
+        triplet => {
+          triplet.sendToDst(triplet.srcAttr)
+          triplet.sendToSrc(triplet.dstAttr)
+        },
+        (a, b) => a || b
+      )
+      val mis_neighbors = neighbor_in_mis.filter({ case (id, in_mis) => in_mis}).map({ case (id, _) => id}).distinct().collect().toSet
+
+      g_mod = g_mod.mapVertices((id, prop) => {
+        if (vertexIds_mis.contains(id)) {
+          VertexProperties(prop.id, prop.degree, -0.1, "inactive", "Yes")
+        } else if (mis_neighbors.contains(id)) {
+          VertexProperties(prop.id, prop.degree, -0.1, "inactive", "No")
+        } else {
+          prop
+        }
+      })
+      println("\tNumber of vertices remaining: " + g_mod.vertices.filter({ case (id, prop) => prop.active == "active"}).count())
+      iterations += 1
     }
+    println("Number of iterations: " + iterations)
+    val vertexRDD = g_mod.vertices
 
-    def hash(s: String): Long = {
-      return ((a * convert(s,s.length) + b) % p) % numBuckets;
-    }
+    val verticeInMIS: RDD[VertexId] = vertexRDD
+      .filter{ case (_, prop) => prop.in_MIS == "Yes"}
+      .map { case (id, _) => id}
 
-    def hash(t: Long): Long = {
-      return ((a * t + b) % p) % numBuckets;
-    }
+    val vertexIDs: Array[VertexId] = verticeInMIS.collect()
+    val out_graph = g_in.mapVertices((id, _) => if (vertexIDs.contains(id)) 1 else -1)
+    return out_graph
+  }
 
-    def zeroes(num: Long, remain: Long): Int =
-    {
-      if((num & 1) == 1 || remain==1)
-        return 0;
-      return 1+zeroes(num >> 1, remain >> 1);
-    }
-
-    def zeroes(num: Long): Int =        /*calculates #consecutive trialing zeroes  */
-    {
-      return zeroes(num, numBuckets)
+def hasNeighborWithAttributeOne(triplet: EdgeContext[Int, Int, Boolean], from: String): Boolean = {
+      if (triplet.srcAttr == 1 && from == "to_dst") {
+      return true
+    } else if (triplet.srcAttr == -1 && from == "to_dst") {
+      return false
+    } else if (triplet.dstAttr == 1 && from == "to_src") {
+      return true
+    } else {
+      return false
     }
   }
 
-  class four_universal_Radamacher_hash_function extends hash_function(2) {  // a 4-universal hash family, numBuckets_in is the numer of buckets
-    override val a: Long = (rand.nextLong % p)   // a is a random number is [0,p]
-    override val b: Long = (rand.nextLong % p) // b is a random number in [0,p]
-    val c: Long = (rand.nextLong % p)   // c is a random number is [0,p]
-    val d: Long = (rand.nextLong % p) // d is a random number in [0,p]
+def verifyMIS(g: Graph[Int, Int]): Boolean = {
+  val independent = g.triplets.flatMap { triplet =>
+    if (triplet.srcAttr == 1 && triplet.dstAttr == 1) {
+      Some((triplet.srcId, triplet.dstId))
+    } else None
+  }.count() == 0
 
-    override def hash(s: String): Long = {     /* returns +1 or -1 with prob. 1/2 */
-      val t= convert(s,s.length)
-      val t2 = t*t % p
-      val t3 = t2*t % p
-      return if ( ( ((a * t3 + b* t2 + c*t + b) % p) & 1) == 0 ) 1 else -1;
-    }
+  val maximal = g.vertices.leftOuterJoin(g.aggregateMessages[Int](
+    triplet => {
+      if (triplet.srcAttr == 1) triplet.sendToDst(1)
+      if (triplet.dstAttr == 1) triplet sendToSrc(1)
+    },
+    (a, b) => a + b
+  )).map {
+    case (id, (label, Some(count))) => label == 1 || count > 0
+    case (id, (label, None)) => label == 1
+  }.reduce(_ && _)
 
-    override def hash(t: Long): Long = {       /* returns +1 or -1 with prob. 1/2 */
-      val t2 = t*t % p
-      val t3 = t2*t % p
-      return if( ( ((a * t3 + b* t2 + c*t + b) % p) & 1) == 0 ) 1 else -1;
-    }
-  }
-
-  class BJKSTSketch(bucket_in: Set[(String, Int)] ,  z_in: Int, bucket_size_in: Int) extends Serializable {
-/* A constructor that requies intialize the bucket and the z value. The bucket size is the bucket size of the sketch. */
-
-    var bucket: Set[(String, Int)] = bucket_in
-    var z: Int = z_in
-
-    val BJKST_bucket_size = bucket_size_in;
-
-    def this(s: String, z_of_s: Int, bucket_size_in: Int){
-      /* A constructor that allows you pass in a single string, zeroes of the string, and the bucket size to initialize the sketch */
-      this(Set((s, z_of_s )) , z_of_s, bucket_size_in)
-    }
-
-    def +(that: BJKSTSketch): BJKSTSketch = {    /* Merging two sketches */
-
-    }
-
-    def add_string(s: String, z_of_s: Int): BJKSTSketch = {   /* add a string to the sketch */
-
-    }
-  }
-
-
-  def tidemark(x: RDD[String], trials: Int): Double = {
-    val h = Seq.fill(trials)(new hash_function(2000000000))
-
-    def param0 = (accu1: Seq[Int], accu2: Seq[Int]) => Seq.range(0,trials).map(i => scala.math.max(accu1(i), accu2(i)))
-    def param1 = (accu1: Seq[Int], s: String) => Seq.range(0,trials).map( i =>  scala.math.max(accu1(i), h(i).zeroes(h(i).hash(s))) )
-
-    val x3 = x.aggregate(Seq.fill(trials)(0))( param1, param0)
-    val ans = x3.map(z => scala.math.pow(2,0.5 + z)).sortWith(_ < _)( trials/2) /* Take the median of the trials */
-
-    return ans
-  }
-
-
-  def BJKST(x: RDD[String], width: Int, trials: Int) : Double = {
-
-  }
-
-
-  def Tug_of_War(x: RDD[String], width: Int, depth:Int) : Long = {
-
-  }
-
-
-  def exact_F0(x: RDD[String]) : Long = {
-    val ans = x.distinct.count
-    return ans
-  }
-
-
-  def exact_F2(x: RDD[String]) : Long = {
-
-  }
-
-
-
-  def main(args: Array[String]) {
-    val spark = SparkSession.builder().appName("Project_2").getOrCreate()
-
-    if(args.length < 2) {
-      println("Usage: project_2 input_path option = {BJKST, tidemark, ToW, exactF2, exactF0} ")
-      sys.exit(1)
-    }
-    val input_path = args(0)
-
-  //    val df = spark.read.format("csv").load("data/2014to2017.csv")
-    val df = spark.read.format("csv").load(input_path)
-    val dfrdd = df.rdd.map(row => row.getString(0))
-
-    val startTimeMillis = System.currentTimeMillis()
-
-    if(args(1)=="BJKST") {
-      if (args.length != 4) {
-        println("Usage: project_2 input_path BJKST #buckets trials")
-        sys.exit(1)
-      }
-      val ans = BJKST(dfrdd, args(2).toInt, args(3).toInt)
-
-      val endTimeMillis = System.currentTimeMillis()
-      val durationSeconds = (endTimeMillis - startTimeMillis) / 1000
-
-      println("==================================")
-      println("BJKST Algorithm. Bucket Size:"+ args(2) + ". Trials:" + args(3) +". Time elapsed:" + durationSeconds + "s. Estimate: "+ans)
-      println("==================================")
-    }
-    else if(args(1)=="tidemark") {
-      if(args.length != 3) {
-        println("Usage: project_2 input_path tidemark trials")
-        sys.exit(1)
-      }
-      val ans = tidemark(dfrdd, args(2).toInt)
-      val endTimeMillis = System.currentTimeMillis()
-      val durationSeconds = (endTimeMillis - startTimeMillis) / 1000
-
-      println("==================================")
-      println("Tidemark Algorithm. Trials:" + args(2) + ". Time elapsed:" + durationSeconds + "s. Estimate: "+ans)
-      println("==================================")
-
-    }
-    else if(args(1)=="ToW") {
-       if(args.length != 4) {
-         println("Usage: project_2 input_path ToW width depth")
-         sys.exit(1)
-      }
-      val ans = Tug_of_War(dfrdd, args(2).toInt, args(3).toInt)
-      val endTimeMillis = System.currentTimeMillis()
-      val durationSeconds = (endTimeMillis - startTimeMillis) / 1000
-      println("==================================")
-      println("Tug-of-War F2 Approximation. Width :" +  args(2) + ". Depth: "+ args(3) + ". Time elapsed:" + durationSeconds + "s. Estimate: "+ans)
-      println("==================================")
-    }
-    else if(args(1)=="exactF2") {
-      if(args.length != 2) {
-        println("Usage: project_2 input_path exactF2")
-        sys.exit(1)
-      }
-      val ans = exact_F2(dfrdd)
-      val endTimeMillis = System.currentTimeMillis()
-      val durationSeconds = (endTimeMillis - startTimeMillis) / 1000
-
-      println("==================================")
-      println("Exact F2. Time elapsed:" + durationSeconds + "s. Estimate: "+ans)
-      println("==================================")
-    }
-    else if(args(1)=="exactF0") {
-      if(args.length != 2) {
-        println("Usage: project_2 input_path exactF0")
-        sys.exit(1)
-      }
-      val ans = exact_F0(dfrdd)
-      val endTimeMillis = System.currentTimeMillis()
-      val durationSeconds = (endTimeMillis - startTimeMillis) / 1000
-
-      println("==================================")
-      println("Exact F0. Time elapsed:" + durationSeconds + "s. Estimate: "+ans)
-      println("==================================")
-    }
-    else {
-      println("Usage: project_2 input_path option = {BJKST, tidemark, ToW, exactF2, exactF0} ")
-      sys.exit(1)
-    }
-
-  }
+  independent && maximal
 }
 
+  def main(args: Array[String]) {
+
+    val conf = new SparkConf().setAppName("project_3")
+    val sc = new SparkContext(conf)
+    val spark = SparkSession.builder.config(conf).getOrCreate()
+/* You can either use sc or spark */
+
+    if(args.length == 0) {
+      println("Usage: project_3 option = {compute, verify}")
+      sys.exit(1)
+    }
+    if(args(0)=="compute") {
+      if(args.length != 3) {
+        println("Usage: project_3 compute graph_path output_path")
+        sys.exit(1)
+      }
+      val startTimeMillis = System.currentTimeMillis()
+      val edges = sc.textFile(args(1)).map(line => {val x = line.split(","); Edge(x(0).toLong, x(1).toLong , 1)} )
+      val g = Graph.fromEdges[Int, Int](edges, 0, edgeStorageLevel = StorageLevel.MEMORY_AND_DISK, vertexStorageLevel = StorageLevel.MEMORY_AND_DISK)
+      val g2 = LubyMIS(g)
+
+      val endTimeMillis = System.currentTimeMillis()
+      val durationSeconds = (endTimeMillis - startTimeMillis) / 1000
+      println("==================================")
+      println("Luby's algorithm completed in " + durationSeconds + "s.")
+      println("==================================")
+
+      val g2df = spark.createDataFrame(g2.vertices)
+      g2df.coalesce(1).write.format("csv").mode("overwrite").save(args(2))
+    }
+    else if(args(0)=="verify") {
+      if(args.length != 3) {
+        println("Usage: project_3 verify graph_path MIS_path")
+        sys.exit(1)
+      }
+
+      val edges = sc.textFile(args(1)).map(line => {val x = line.split(","); Edge(x(0).toLong, x(1).toLong , 1)} )
+      val vertices = sc.textFile(args(2)).map(line => {val x = line.split(","); (x(0).toLong, x(1).toInt) })
+      val g = Graph[Int, Int](vertices, edges, edgeStorageLevel = StorageLevel.MEMORY_AND_DISK, vertexStorageLevel = StorageLevel.MEMORY_AND_DISK)
+
+      val ans = verifyMIS(g)
+      if(ans)
+        println("Yes")
+      else
+        println("No")
+    }
+    else
+    {
+        println("Usage: project_3 option = {compute, verify}")
+        sys.exit(1)
+    }
+  }
+}
